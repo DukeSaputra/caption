@@ -26,8 +26,8 @@ const SUPPORTED_MODELS: &[ModelInfo] = &[
     },
     ModelInfo {
         name: "silero-vad",
-        url: "https://github.com/snakers4/silero-vad/raw/980b17e9d56463e51393a8d92ded473f1b17896a/src/silero_vad/data/silero_vad.onnx",
-        sha256: "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3",
+        url: "https://github.com/snakers4/silero-vad/raw/v5.1.2/src/silero_vad/data/silero_vad.onnx",
+        sha256: "2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f",
         filename: "silero_vad.onnx",
         needs_extraction: false,
     },
