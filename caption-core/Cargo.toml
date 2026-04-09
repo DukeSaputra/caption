@@ -1,0 +1,27 @@
+[package]
+name = "caption-core"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["parakeet"]
+metal = ["whisper-rs/metal"]
+parakeet = ["sherpa-onnx"]
+
+[dependencies]
+symphonia = { version = "0.5", features = ["all"] }
+rubato = "0.14"
+whisper-rs = "0.16"
+sherpa-onnx = { version = "1.12", default-features = false, features = ["static"], optional = true }
+# Pinned to rc.11: rc.12 has a VitisAI compilation bug. Bump to 2.0.0 stable when released.
+# load-dynamic avoids duplicate ONNX Runtime symbols with sherpa-onnx-sys's static linking.
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
+dirs = "5"
+thiserror = "2"
+log = "0.4"
+tiny-skia = "0.11"
+ab_glyph = "0.2"
+
+[dev-dependencies]
+hound = "3.5"
+tempfile = "3"
