@@ -113,7 +113,7 @@ struct Cli {
     #[arg(long, default_value = "srt", value_parser = ["srt", "vtt", "ass", "txt"], help = "Output subtitle format")]
     format: String,
 
-    #[arg(long, default_value = "whisper", value_parser = ["whisper", "parakeet"], help = "STT engine to use for transcription")]
+    #[arg(long, default_value = "whisper", value_parser = ["whisper", "parakeet"], help = "STT engine to use for transcription", hide = true)]
     engine: String,
 
     #[arg(

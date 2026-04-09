@@ -155,11 +155,9 @@ caption video.mp4 --burn
 
 This creates `video.srt` and `video-captioned.mp4` with the subtitles baked into the video.
 
-> **Tip:** If the burned subtitles have errors, you can fix them without re-transcribing. First generate the subtitle file on its own, edit `video.srt` in any text editor to fix mistakes, then burn the corrected version:
+> **Tip:** If the burned subtitles have errors, you can fix them without re-transcribing. First generate the subtitle file on its own, edit it in any text editor to fix mistakes, then burn the corrected version:
 > ```
-> caption video.mp4
-> # edit video.srt to fix any errors
-> caption video.mp4 --srt video.srt
+> caption path/to/video.mp4 --srt path/to/video.srt
 > ```
 
 > **Tip:** You don't need to type file paths manually.
