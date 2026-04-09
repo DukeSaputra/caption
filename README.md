@@ -126,7 +126,7 @@ caption setup
 | Silero VAD v5 | 2 MB | [GitHub](https://github.com/snakers4/silero-vad) | Voice activity detection, reduces hallucinations |
 | wav2vec2-base-960h | 91 MB | [HuggingFace](https://huggingface.co/onnx-community/wav2vec2-base-960h-ONNX) | CTC forced alignment (~20ms word timestamps) |
 | FFmpeg | ~80 MB | [GitHub](https://github.com/eugeneware/ffmpeg-static) | Audio extraction from video files |
-| ONNX Runtime | ~30 MB | [Microsoft GitHub](https://github.com/microsoft/onnxruntime) | Inference backend for alignment and VAD |
+| ONNX Runtime | ~50 MB | [Microsoft GitHub](https://github.com/microsoft/onnxruntime) | Inference backend for alignment and VAD |
 | Inter Bold | <1 MB | [Google Fonts](https://fonts.google.com/specimen/Inter) | Font for burned-in subtitles (`--burn`) |
 
 SHA256 hashes are verified automatically for models. Use `--skip-hash` only if verification fails due to an upstream model update.

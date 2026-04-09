@@ -411,7 +411,7 @@ fn download_ffmpeg(dir: &Path) -> Result<()> {
 }
 
 fn download_onnxruntime(dir: &Path) -> Result<()> {
-    let version = "1.22.0";
+    let version = "1.24.4";
     let (url, archive_ext, lib_name) = if cfg!(target_os = "macos") {
         (
             format!("https://github.com/microsoft/onnxruntime/releases/download/v{version}/onnxruntime-osx-universal2-{version}.tgz"),
