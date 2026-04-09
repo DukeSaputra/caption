@@ -391,8 +391,13 @@ fn run_burn_from_srt(cli: &Cli, input: &Path, srt_path: &Path) -> Result<()> {
                         debug!("Failed to load aligner: {e}");
                         None
                     }
-                    Err(_) => {
-                        debug!("ONNX Runtime not available for alignment");
+                    Err(panic_info) => {
+                        let reason = panic_info
+                            .downcast_ref::<String>()
+                            .map(|s| s.as_str())
+                            .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                            .unwrap_or("unknown");
+                        debug!("ONNX Runtime panicked loading aligner: {reason}");
                         None
                     }
                 }
@@ -706,8 +711,13 @@ fn run_transcribe(cli: &Cli) -> Result<()> {
                         warnings.push(format!("Failed to load VAD model: {e}"));
                         None
                     }
-                    Err(_) => {
-                        debug!("ONNX Runtime not available, skipping standalone VAD");
+                    Err(panic_info) => {
+                        let reason = panic_info
+                            .downcast_ref::<String>()
+                            .map(|s| s.as_str())
+                            .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                            .unwrap_or("unknown");
+                        debug!("ONNX Runtime panicked loading VAD: {reason}");
                         warnings.push(ort_not_found_message("VAD and alignment"));
                         None
                     }
@@ -743,8 +753,13 @@ fn run_transcribe(cli: &Cli) -> Result<()> {
                         ));
                         None
                     }
-                    Err(_) => {
-                        debug!("ONNX Runtime not available, skipping forced alignment");
+                    Err(panic_info) => {
+                        let reason = panic_info
+                            .downcast_ref::<String>()
+                            .map(|s| s.as_str())
+                            .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                            .unwrap_or("unknown");
+                        debug!("ONNX Runtime panicked loading aligner: {reason}");
                         if !warnings.iter().any(|w| w.contains("ONNX Runtime")) {
                             warnings.push(ort_not_found_message("alignment"));
                         }
