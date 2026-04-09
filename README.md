@@ -141,9 +141,26 @@ Models are saved to `~/Library/Application Support/caption/models` on macOS, `%A
 
 Type `caption ` (with a space after it), then paste the path to any video or audio file. Press Enter.
 
+**Generate subtitles:**
 ```
-caption ~/Desktop/my-video.mp4
+caption video.mp4
 ```
+
+This creates `video.srt` in the same folder as the video.
+
+**Generate subtitles and burn them into the video:**
+```
+caption video.mp4 --burn
+```
+
+This creates `video.srt` and `video-captioned.mp4` with the subtitles baked into the video.
+
+> **Tip:** If the burned subtitles have errors, you can fix them without re-transcribing. First generate the subtitle file on its own, edit `video.srt` in any text editor to fix mistakes, then burn the corrected version:
+> ```
+> caption video.mp4
+> # edit video.srt to fix any errors
+> caption video.mp4 --srt video.srt
+> ```
 
 > **Tip:** You don't need to type file paths manually.
 > - **macOS:** Drag a file from Finder into Terminal to paste its path. Or right-click while holding **Option** and select **Copy as Pathname**.
