@@ -42,7 +42,7 @@ No admin privileges required.
 **2.** Copy and paste this entire block into Terminal, then press Enter:
 
 ```
-if [ ! -f ~/Downloads/caption-macos-universal ]; then echo "caption-macos-universal not found. Move it to your Downloads folder and try again."; else mkdir -p ~/.local/bin && mv ~/Downloads/caption-macos-universal ~/.local/bin/caption && chmod +x ~/.local/bin/caption && xattr -d com.apple.quarantine ~/.local/bin/caption && (grep -q '.local/bin' ~/.zshrc 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc) && source ~/.zshrc && echo "Installed. Run: caption --help"; fi
+if [ ! -f ~/Downloads/caption-macos-universal ]; then echo "caption-macos-universal not found. Move it to your Downloads folder and try again."; else mkdir -p ~/.local/bin && mv ~/Downloads/caption-macos-universal ~/.local/bin/caption && chmod +x ~/.local/bin/caption && xattr -d com.apple.quarantine ~/.local/bin/caption 2>/dev/null; (grep -q '.local/bin' ~/.zshrc 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc) && source ~/.zshrc && echo "Installed. Run: caption --help"; fi
 ```
 
 If you see `Installed`, you're all set. Continue to Step 3.
