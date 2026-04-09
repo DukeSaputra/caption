@@ -42,10 +42,10 @@ No admin privileges required.
 **2.** Copy and paste this entire block into Terminal, then press Enter:
 
 ```
-if [ ! -f ~/Downloads/caption-macos-universal ]; then echo "caption-macos-universal not found. Move it to your Downloads folder and try again."; else mkdir -p ~/.local/bin && mv ~/Downloads/caption-macos-universal ~/.local/bin/caption && chmod +x ~/.local/bin/caption && xattr -d com.apple.quarantine ~/.local/bin/caption 2>/dev/null; (grep -q '.local/bin' ~/.zshrc 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc) && source ~/.zshrc && echo "Installed. Run: caption --help"; fi
+if [ ! -f ~/Downloads/caption-macos-universal ]; then echo "caption-macos-universal not found. Move it to your Downloads folder and try again."; else mkdir -p ~/.local/bin && mv ~/Downloads/caption-macos-universal ~/.local/bin/caption && chmod +x ~/.local/bin/caption && xattr -d com.apple.quarantine ~/.local/bin/caption 2>/dev/null; (grep -q '.local/bin' ~/.zshrc 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc) && source ~/.zshrc && caption setup; fi
 ```
 
-If you see `Installed`, you're all set. Continue to Step 3.
+This installs the binary and downloads all required models (~1.1 GB). It may take 5-15 minutes depending on your connection. If it gets interrupted, just run `caption setup` to resume.
 
 > **Troubleshooting:**
 >
@@ -79,10 +79,10 @@ If you see `Installed`, you're all set. Continue to Step 3.
 **2.** Copy and paste this entire block, then press Enter:
 
 ```
-if [ ! -f ~/Downloads/caption-linux-x86_64 ]; then echo "caption-linux-x86_64 not found. Move it to your Downloads folder and try again."; else mkdir -p ~/.local/bin && mv ~/Downloads/caption-linux-x86_64 ~/.local/bin/caption && chmod +x ~/.local/bin/caption && (grep -q '.local/bin' ~/.bashrc 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc) && source ~/.bashrc && echo "Installed. Run: caption --help"; fi
+if [ ! -f ~/Downloads/caption-linux-x86_64 ]; then echo "caption-linux-x86_64 not found. Move it to your Downloads folder and try again."; else mkdir -p ~/.local/bin && mv ~/Downloads/caption-linux-x86_64 ~/.local/bin/caption && chmod +x ~/.local/bin/caption && (grep -q '.local/bin' ~/.bashrc 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc) && source ~/.bashrc && caption setup; fi
 ```
 
-If you see `Installed`, you're all set. Continue to Step 3.
+This installs the binary and downloads all required models (~1.1 GB). If it gets interrupted, run `caption setup` to resume.
 
 > `command not found` after running `caption --help` means the PATH update didn't take effect. Close your terminal and open a new one, then try again.
 
@@ -98,10 +98,14 @@ If you see `Installed`, you're all set. Continue to Step 3.
 **1.** Open **PowerShell** and paste this entire block, then press Enter:
 
 ```
-if (!(Test-Path "$HOME\Downloads\caption-windows-x86_64.exe")) { Write-Host "caption-windows-x86_64.exe not found. Move it to your Downloads folder and try again." } else { New-Item -ItemType Directory -Force -Path "$HOME\caption" | Out-Null; Move-Item "$HOME\Downloads\caption-windows-x86_64.exe" "$HOME\caption\caption.exe" -Force; [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$HOME\caption", "User"); Write-Host "Installed. Close and reopen PowerShell, then run: caption --help" }
+if (!(Test-Path "$HOME\Downloads\caption-windows-x86_64.exe")) { Write-Host "caption-windows-x86_64.exe not found. Move it to your Downloads folder and try again." } else { New-Item -ItemType Directory -Force -Path "$HOME\caption" | Out-Null; Move-Item "$HOME\Downloads\caption-windows-x86_64.exe" "$HOME\caption\caption.exe" -Force; [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$HOME\caption", "User"); Write-Host "Installed. Close and reopen PowerShell to continue setup." }
 ```
 
-If you see `Installed`, close and reopen PowerShell, then run `caption --help` to confirm.
+Close and reopen PowerShell, then run:
+
+```
+caption setup
+```
 
 > `caption is not recognized` means the PATH update hasn't taken effect. Make sure you closed and reopened PowerShell after the install command.
 
@@ -109,35 +113,7 @@ If you see `Installed`, close and reopen PowerShell, then run `caption --help` t
 
 ---
 
-### Step 3: Download Dependencies
-
-Make sure you have at least **1.5 GB of free disk space**. The download is ~1.1 GB and may take 5-15 minutes depending on your connection. If it times out or gets interrupted, just run the command again; already-downloaded files are skipped.
-
-```
-caption setup
-```
-
-<details>
-<summary>What gets downloaded</summary>
-
-| Component | Size | Source | Purpose |
-|-----------|------|--------|---------|
-| Whisper large-v3-turbo Q8_0 | 874 MB | [HuggingFace](https://huggingface.co/ggerganov/whisper.cpp) | Speech recognition via whisper.cpp |
-| Silero VAD v5 | 2 MB | [GitHub](https://github.com/snakers4/silero-vad) | Voice activity detection, reduces hallucinations |
-| wav2vec2-base-960h | 91 MB | [HuggingFace](https://huggingface.co/onnx-community/wav2vec2-base-960h-ONNX) | CTC forced alignment (~20ms word timestamps) |
-| FFmpeg | ~80 MB | [GitHub](https://github.com/eugeneware/ffmpeg-static) | Audio extraction from video files |
-| ONNX Runtime | ~50 MB | [Microsoft GitHub](https://github.com/microsoft/onnxruntime) | Inference backend for alignment and VAD |
-| Inter Bold | <1 MB | [Google Fonts](https://fonts.google.com/specimen/Inter) | Font for burned-in subtitles (`--burn`) |
-
-SHA256 hashes are verified automatically for models. Use `--skip-hash` only if verification fails due to an upstream model update.
-
-Models are saved to `~/Library/Application Support/caption/models` on macOS, `%APPDATA%\caption\models` on Windows, and `~/.local/share/caption/models` on Linux. FFmpeg, ONNX Runtime, and the font are placed next to the `caption` binary.
-
-</details>
-
----
-
-### Step 4: Try It
+### Step 3: Try It
 
 Type `caption ` (with a space after it), then paste the path to any video or audio file. Press Enter.
 
