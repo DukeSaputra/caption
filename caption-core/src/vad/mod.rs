@@ -26,7 +26,7 @@ const DEFAULT_THRESHOLD: f32 = 0.45;
 
 const DEFAULT_MIN_SPEECH_SECONDS: f64 = 0.100;
 
-const DEFAULT_MIN_SILENCE_SECONDS: f64 = 0.500;
+const DEFAULT_MIN_SILENCE_SECONDS: f64 = 2.0;
 
 const DEFAULT_SPEECH_PAD_SECONDS: f64 = 0.200;
 
@@ -351,7 +351,7 @@ mod tests {
         let config = VadConfig::default();
         assert!((config.threshold - 0.45).abs() < f32::EPSILON);
         assert!((config.min_speech_seconds - 0.100).abs() < f64::EPSILON);
-        assert!((config.min_silence_seconds - 0.100).abs() < f64::EPSILON);
+        assert!((config.min_silence_seconds - 2.0).abs() < f64::EPSILON);
         assert!((config.speech_pad_seconds - 0.200).abs() < f64::EPSILON);
     }
 
@@ -787,7 +787,10 @@ mod tests {
 
     #[test]
     fn full_pipeline_separate_regions() {
-        let config = VadConfig::default();
+        let config = VadConfig {
+            min_silence_seconds: 0.100,
+            ..VadConfig::default()
+        };
 
         let mut probs = vec![0.1_f32; 100];
         for p in probs.iter_mut().skip(5).take(11) {
