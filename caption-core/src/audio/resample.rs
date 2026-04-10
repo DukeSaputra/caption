@@ -20,6 +20,7 @@ pub fn prepare_for_stt(audio: AudioData) -> Result<Vec<f32>, CaptionError> {
 
     remove_dc_offset(&mut mono);
     peak_normalize(&mut mono);
+    compress_dynamic_range(&mut mono, source_rate);
     highpass_filter(&mut mono, 80.0, source_rate);
 
     if source_rate == TARGET_SAMPLE_RATE {
@@ -114,6 +115,56 @@ fn peak_normalize(samples: &mut [f32]) {
     for s in samples.iter_mut() {
         *s *= gain;
     }
+}
+
+/// Soft feed-forward compressor that reduces dynamic range before CTC alignment.
+///
+/// Why: wav2vec2 emits blank-dominated probabilities on quiet passages, which
+/// causes the Viterbi aligner to cluster words near the next loud region.
+/// Compressing the dynamic range lifts quiet speech closer to the loud parts
+/// so every frame carries usable acoustic evidence.
+fn compress_dynamic_range(samples: &mut [f32], sample_rate: u32) {
+    if samples.is_empty() {
+        return;
+    }
+
+    // -24 dBFS threshold, 4:1 ratio, 5ms attack, 80ms release.
+    // No makeup gain needed: the Whisper/wav2vec2/VAD front-ends all
+    // normalize internally via log-mel, so absolute level is irrelevant.
+    let threshold = 10.0_f32.powf(-24.0 / 20.0);
+    let ratio = 4.0_f32;
+    let attack_ms = 5.0_f32;
+    let release_ms = 80.0_f32;
+
+    let sr = sample_rate as f32;
+    let alpha_attack = 1.0 - (-1.0 / (attack_ms * 0.001 * sr)).exp();
+    let alpha_release = 1.0 - (-1.0 / (release_ms * 0.001 * sr)).exp();
+
+    let exponent = 1.0 / ratio - 1.0;
+    let mut envelope = 0.0_f32;
+
+    for s in samples.iter_mut() {
+        let abs_x = s.abs();
+        let alpha = if abs_x > envelope {
+            alpha_attack
+        } else {
+            alpha_release
+        };
+        envelope += alpha * (abs_x - envelope);
+
+        if envelope > threshold {
+            let gain = (envelope / threshold).powf(exponent);
+            *s *= gain;
+        }
+    }
+
+    debug!(
+        "Compressing dynamic range: threshold = {:.0} dBFS, ratio = {:.1}:1, attack = {:.0}ms, release = {:.0}ms",
+        20.0 * threshold.log10(),
+        ratio,
+        attack_ms,
+        release_ms
+    );
 }
 
 fn highpass_filter(samples: &mut [f32], cutoff_hz: f32, sample_rate: u32) {
@@ -458,6 +509,84 @@ mod tests {
         let mut samples: Vec<f32> = vec![];
         peak_normalize(&mut samples);
         assert!(samples.is_empty());
+    }
+
+    // ── Dynamic range compression ────────────────────────────────────
+
+    #[test]
+    fn compressor_empty_input() {
+        let mut samples: Vec<f32> = vec![];
+        compress_dynamic_range(&mut samples, 16_000);
+        assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn compressor_reduces_dynamic_range() {
+        let sample_rate = 16_000_u32;
+        // 1 second: quiet first half, loud second half
+        let num_samples = sample_rate as usize;
+        let mut samples: Vec<f32> = Vec::with_capacity(num_samples);
+        for i in 0..num_samples {
+            let t = i as f32 / sample_rate as f32;
+            let carrier = (t * 440.0 * 2.0 * std::f32::consts::PI).sin();
+            // First half: -24 dBFS, second half: -3 dBFS
+            let amp = if i < num_samples / 2 {
+                10.0_f32.powf(-24.0 / 20.0)
+            } else {
+                10.0_f32.powf(-3.0 / 20.0)
+            };
+            samples.push(carrier * amp);
+        }
+
+        let quiet_rms_before = rms(&samples[..num_samples / 2]);
+        let loud_rms_before = rms(&samples[num_samples / 2..]);
+        let range_before = loud_rms_before / quiet_rms_before;
+
+        compress_dynamic_range(&mut samples, sample_rate);
+
+        // Skip attack-transient region when measuring post-compression RMS
+        let settle = (sample_rate as usize) / 20; // 50ms
+        let quiet_rms_after = rms(&samples[settle..num_samples / 2]);
+        let loud_rms_after = rms(&samples[num_samples / 2 + settle..]);
+        let range_after = loud_rms_after / quiet_rms_after;
+
+        assert!(
+            range_after < range_before * 0.5,
+            "Compressor should reduce dynamic range by at least 2x: before = {range_before:.2}, after = {range_after:.2}"
+        );
+    }
+
+    #[test]
+    fn compressor_leaves_below_threshold_unchanged() {
+        let sample_rate = 16_000_u32;
+        // All samples well below -24 dBFS threshold
+        let quiet = 10.0_f32.powf(-40.0 / 20.0);
+        let mut samples: Vec<f32> = (0..sample_rate as usize)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                (t * 440.0 * 2.0 * std::f32::consts::PI).sin() * quiet
+            })
+            .collect();
+        let original = samples.clone();
+
+        compress_dynamic_range(&mut samples, sample_rate);
+
+        for (a, b) in samples.iter().zip(original.iter()) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "Below-threshold samples should be unchanged: {a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn compressor_preserves_polarity() {
+        let mut samples = vec![0.5_f32, -0.5, 0.8, -0.8, 0.3, -0.3];
+        compress_dynamic_range(&mut samples, 16_000);
+        assert!(samples[0] > 0.0);
+        assert!(samples[1] < 0.0);
+        assert!(samples[2] > 0.0);
+        assert!(samples[3] < 0.0);
     }
 
     // ── High-pass filter ─────────────────────────────────────────────
