@@ -28,7 +28,7 @@ const DEFAULT_MIN_SPEECH_SECONDS: f64 = 0.100;
 
 const DEFAULT_MIN_SILENCE_SECONDS: f64 = 1.0;
 
-const DEFAULT_SPEECH_PAD_SECONDS: f64 = 0.200;
+const DEFAULT_SPEECH_PAD_SECONDS: f64 = 0.500;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -261,6 +261,7 @@ pub fn extract_chunks(
     sample_rate: u32,
     segments: &[SpeechSegment],
     padding_seconds: f64,
+    min_chunk_seconds: f64,
     max_chunk_seconds: f64,
 ) -> Vec<(Vec<f32>, f64)> {
     if segments.is_empty() || audio.is_empty() {
@@ -280,7 +281,9 @@ pub fn extract_chunks(
 
     let merged = merge_close_segments(padded, 0.0);
 
-    let final_segments = split_long_segments(merged, max_chunk_seconds);
+    let long_enough = merge_to_minimum_length(merged, min_chunk_seconds);
+
+    let final_segments = split_long_segments(long_enough, max_chunk_seconds);
 
     final_segments
         .into_iter()
@@ -291,6 +294,37 @@ pub fn extract_chunks(
             (chunk, seg.start)
         })
         .collect()
+}
+
+fn merge_to_minimum_length(segments: Vec<SpeechSegment>, min_seconds: f64) -> Vec<SpeechSegment> {
+    if segments.len() <= 1 || min_seconds <= 0.0 {
+        return segments;
+    }
+
+    let mut result: Vec<SpeechSegment> = Vec::new();
+    let mut i = 0;
+    while i < segments.len() {
+        let mut current = segments[i].clone();
+        i += 1;
+        while (current.end - current.start) < min_seconds && i < segments.len() {
+            current.end = segments[i].end;
+            i += 1;
+        }
+        result.push(current);
+    }
+
+    if result.len() > 1 {
+        let last_duration = {
+            let last = result.last().expect("non-empty");
+            last.end - last.start
+        };
+        if last_duration < min_seconds {
+            let last = result.pop().expect("non-empty");
+            result.last_mut().expect("non-empty").end = last.end;
+        }
+    }
+
+    result
 }
 
 fn split_long_segments(segments: Vec<SpeechSegment>, max_seconds: f64) -> Vec<SpeechSegment> {
@@ -352,7 +386,7 @@ mod tests {
         assert!((config.threshold - 0.45).abs() < f32::EPSILON);
         assert!((config.min_speech_seconds - 0.100).abs() < f64::EPSILON);
         assert!((config.min_silence_seconds - 1.0).abs() < f64::EPSILON);
-        assert!((config.speech_pad_seconds - 0.200).abs() < f64::EPSILON);
+        assert!((config.speech_pad_seconds - 0.500).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -665,7 +699,7 @@ mod tests {
     #[test]
     fn extract_chunks_empty_segments() {
         let audio = vec![0.0_f32; 16_000];
-        let chunks = extract_chunks(&audio, 16_000, &[], 0.1, 30.0);
+        let chunks = extract_chunks(&audio, 16_000, &[], 0.1, 0.0, 30.0);
         assert!(chunks.is_empty());
     }
 
@@ -675,7 +709,7 @@ mod tests {
             start: 0.0,
             end: 1.0,
         }];
-        let chunks = extract_chunks(&[], 16_000, &segments, 0.1, 30.0);
+        let chunks = extract_chunks(&[], 16_000, &segments, 0.1, 0.0, 30.0);
         assert!(chunks.is_empty());
     }
 
@@ -686,7 +720,7 @@ mod tests {
             start: 1.0,
             end: 2.0,
         }];
-        let chunks = extract_chunks(&audio, 16_000, &segments, 0.1, 30.0);
+        let chunks = extract_chunks(&audio, 16_000, &segments, 0.1, 0.0, 30.0);
         assert_eq!(chunks.len(), 1);
 
         let (chunk, start) = &chunks[0];
@@ -706,7 +740,7 @@ mod tests {
             start: 0.0,
             end: 2.0,
         }];
-        let chunks = extract_chunks(&audio, 16_000, &segments, 0.5, 30.0);
+        let chunks = extract_chunks(&audio, 16_000, &segments, 0.5, 0.0, 30.0);
         assert_eq!(chunks.len(), 1);
         let (chunk, start) = &chunks[0];
         assert!((start - 0.0).abs() < f64::EPSILON);
@@ -720,7 +754,7 @@ mod tests {
             start: 0.0,
             end: 90.0,
         }];
-        let chunks = extract_chunks(&audio, 16_000, &segments, 0.0, 30.0);
+        let chunks = extract_chunks(&audio, 16_000, &segments, 0.0, 0.0, 30.0);
         assert_eq!(chunks.len(), 3);
 
         for (chunk, _) in &chunks {
@@ -745,7 +779,102 @@ mod tests {
                 end: 1.5,
             },
         ];
-        let chunks = extract_chunks(&audio, 16_000, &segments, 0.1, 30.0);
+        let chunks = extract_chunks(&audio, 16_000, &segments, 0.1, 0.0, 30.0);
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn merge_to_minimum_leaves_long_chunks_alone() {
+        let segments = vec![
+            SpeechSegment {
+                start: 0.0,
+                end: 10.0,
+            },
+            SpeechSegment {
+                start: 12.0,
+                end: 20.0,
+            },
+        ];
+        let result = merge_to_minimum_length(segments, 5.0);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn merge_to_minimum_merges_short_forward() {
+        let segments = vec![
+            SpeechSegment {
+                start: 0.0,
+                end: 2.0,
+            },
+            SpeechSegment {
+                start: 3.0,
+                end: 5.0,
+            },
+            SpeechSegment {
+                start: 6.0,
+                end: 12.0,
+            },
+        ];
+        let result = merge_to_minimum_length(segments, 5.0);
+        assert_eq!(result.len(), 2);
+        assert!((result[0].start - 0.0).abs() < f64::EPSILON);
+        assert!((result[0].end - 5.0).abs() < f64::EPSILON);
+        assert!((result[1].start - 6.0).abs() < f64::EPSILON);
+        assert!((result[1].end - 12.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn merge_to_minimum_folds_short_trailing_into_previous() {
+        let segments = vec![
+            SpeechSegment {
+                start: 0.0,
+                end: 10.0,
+            },
+            SpeechSegment {
+                start: 12.0,
+                end: 13.0,
+            },
+        ];
+        let result = merge_to_minimum_length(segments, 5.0);
+        assert_eq!(result.len(), 1);
+        assert!((result[0].start - 0.0).abs() < f64::EPSILON);
+        assert!((result[0].end - 13.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn merge_to_minimum_zero_is_noop() {
+        let segments = vec![
+            SpeechSegment {
+                start: 0.0,
+                end: 1.0,
+            },
+            SpeechSegment {
+                start: 2.0,
+                end: 3.0,
+            },
+        ];
+        let result = merge_to_minimum_length(segments, 0.0);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn extract_chunks_honors_min_chunk_seconds() {
+        let audio = vec![0.5_f32; 20 * 16_000];
+        let segments = vec![
+            SpeechSegment {
+                start: 0.0,
+                end: 2.0,
+            },
+            SpeechSegment {
+                start: 5.0,
+                end: 7.0,
+            },
+            SpeechSegment {
+                start: 10.0,
+                end: 12.0,
+            },
+        ];
+        let chunks = extract_chunks(&audio, 16_000, &segments, 0.0, 5.0, 30.0);
         assert_eq!(chunks.len(), 1);
     }
 

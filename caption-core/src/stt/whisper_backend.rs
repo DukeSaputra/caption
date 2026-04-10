@@ -67,7 +67,9 @@ impl SpeechRecognizer for WhisperBackend {
 
         params.set_no_context(true);
 
-        // 2.4 avoids false fallback on casual speech with limited vocabulary
+        params.set_temperature(config.temperature);
+        params.set_temperature_inc(0.2);
+
         params.set_entropy_thold(2.4);
 
         if let Some(ref vad_path) = config.vad_model_path {
@@ -238,6 +240,8 @@ pub(crate) fn join_tokens_into_words(tokens: &[RawToken]) -> Vec<Word> {
         });
     }
 
+    words.retain(|w| w.text.chars().any(|c| c.is_alphanumeric()));
+
     words
 }
 
@@ -338,6 +342,60 @@ mod tests {
     #[test]
     fn empty_tokens_produce_no_words() {
         let tokens: Vec<RawToken> = vec![];
+        let words = join_tokens_into_words(&tokens);
+        assert!(words.is_empty());
+    }
+
+    #[test]
+    fn standalone_punctuation_token_is_dropped() {
+        let tokens = vec![
+            RawToken {
+                text: " -".to_string(),
+                t0: 1,
+                t1: 18,
+                p: 0.5,
+            },
+            RawToken {
+                text: " Audio".to_string(),
+                t0: 18,
+                t1: 90,
+                p: 0.9,
+            },
+        ];
+        let words = join_tokens_into_words(&tokens);
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].text, "Audio");
+    }
+
+    #[test]
+    fn punctuation_attached_to_word_is_kept() {
+        let tokens = vec![RawToken {
+            text: " wow!".to_string(),
+            t0: 0,
+            t1: 30,
+            p: 0.9,
+        }];
+        let words = join_tokens_into_words(&tokens);
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].text, "wow!");
+    }
+
+    #[test]
+    fn all_punctuation_tokens_produce_empty_list() {
+        let tokens = vec![
+            RawToken {
+                text: " -".to_string(),
+                t0: 0,
+                t1: 10,
+                p: 0.5,
+            },
+            RawToken {
+                text: " ...".to_string(),
+                t0: 10,
+                t1: 20,
+                p: 0.5,
+            },
+        ];
         let words = join_tokens_into_words(&tokens);
         assert!(words.is_empty());
     }

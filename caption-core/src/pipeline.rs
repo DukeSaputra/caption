@@ -6,15 +6,13 @@ use crate::error::CaptionError;
 use crate::stt::{SpeechRecognizer, TranscribeConfig, Transcription, Word};
 use crate::vad::{extract_chunks, StandaloneVad};
 
-/// Minimum CTC alignment confidence required to overwrite Whisper's
-/// backend timestamps. Below this we keep Whisper's word timings, which
-/// are noisier but never cluster or collapse to zero.
-const MIN_ALIGNMENT_CONFIDENCE: f32 = 0.3;
+const MIN_ALIGNMENT_CONFIDENCE: f32 = 0.0;
 
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
     pub transcribe_config: TranscribeConfig,
     pub padding_seconds: f64,
+    pub min_chunk_seconds: f64,
     pub max_chunk_seconds: f64,
 }
 
@@ -22,7 +20,8 @@ impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
             transcribe_config: TranscribeConfig::default(),
-            padding_seconds: 0.1,
+            padding_seconds: 0.3,
+            min_chunk_seconds: 5.0,
             max_chunk_seconds: 30.0,
         }
     }
@@ -57,6 +56,7 @@ pub fn transcribe_pipeline(
                 sample_rate,
                 &segments,
                 config.padding_seconds,
+                config.min_chunk_seconds,
                 config.max_chunk_seconds,
             );
 
@@ -123,9 +123,6 @@ pub fn transcribe_pipeline(
                 .map(|w| w.text.clone())
                 .collect();
 
-            // Compress only the audio fed into the CTC aligner. VAD and
-            // Whisper above ran on uncompressed audio so their decisions
-            // aren't biased by equalized dynamics.
             let mut aligner_audio = chunk_audio.clone();
             compress_dynamic_range(&mut aligner_audio, sample_rate);
 
@@ -174,14 +171,6 @@ pub fn transcribe_pipeline(
     })
 }
 
-/// Walk the word list and guarantee monotonically non-decreasing timestamps.
-///
-/// Why: we mix CTC alignments (for high-confidence words) with Whisper's
-/// backend timestamps (for low-confidence or zero-duration ones). The two
-/// sources don't always agree on the absolute timeline, so the merged
-/// sequence can be non-monotonic. Downstream (SRT writer's overlap clamp)
-/// then produces negative-duration cues. Clamp `start` forward and keep
-/// `end >= start` so no cue inverts.
 fn enforce_monotonic_timestamps(words: &mut [Word]) {
     let mut prev_start = f64::NEG_INFINITY;
     for word in words.iter_mut() {
@@ -255,6 +244,16 @@ mod tests {
 
     struct MockAligner {
         offsets: Vec<(f64, f64)>,
+        next_idx: usize,
+    }
+
+    impl MockAligner {
+        fn new(offsets: Vec<(f64, f64)>) -> Self {
+            Self {
+                offsets,
+                next_idx: 0,
+            }
+        }
     }
 
     impl ForcedAligner for MockAligner {
@@ -265,12 +264,14 @@ mod tests {
             words: &[String],
         ) -> Result<Vec<WordAlignment>, CaptionError> {
             let mut result = Vec::with_capacity(words.len());
-            for (i, text) in words.iter().enumerate() {
-                let (start, end) = if i < self.offsets.len() {
-                    self.offsets[i]
-                } else {
-                    (i as f64 * 0.5, i as f64 * 0.5 + 0.4)
-                };
+            for text in words.iter() {
+                let idx = self.next_idx;
+                self.next_idx += 1;
+                let (start, end) = self
+                    .offsets
+                    .get(idx)
+                    .copied()
+                    .unwrap_or((idx as f64 * 0.5, idx as f64 * 0.5 + 0.4));
                 result.push(WordAlignment {
                     text: text.clone(),
                     start,
@@ -284,6 +285,16 @@ mod tests {
 
     struct ConfigurableAligner {
         alignments: Vec<(f64, f64, f32)>,
+        next_idx: usize,
+    }
+
+    impl ConfigurableAligner {
+        fn new(alignments: Vec<(f64, f64, f32)>) -> Self {
+            Self {
+                alignments,
+                next_idx: 0,
+            }
+        }
     }
 
     impl ForcedAligner for ConfigurableAligner {
@@ -293,20 +304,20 @@ mod tests {
             _sample_rate: u32,
             words: &[String],
         ) -> Result<Vec<WordAlignment>, CaptionError> {
-            Ok(words
-                .iter()
-                .enumerate()
-                .map(|(i, text)| {
-                    let (start, end, confidence) =
-                        self.alignments.get(i).copied().unwrap_or((0.0, 0.0, 0.0));
-                    WordAlignment {
-                        text: text.clone(),
-                        start,
-                        end,
-                        confidence,
-                    }
-                })
-                .collect())
+            let mut result = Vec::with_capacity(words.len());
+            for text in words.iter() {
+                let idx = self.next_idx;
+                self.next_idx += 1;
+                let (start, end, confidence) =
+                    self.alignments.get(idx).copied().unwrap_or((0.0, 0.0, 0.0));
+                result.push(WordAlignment {
+                    text: text.clone(),
+                    start,
+                    end,
+                    confidence,
+                });
+            }
+            Ok(result)
         }
     }
 
@@ -392,9 +403,7 @@ mod tests {
             make_word("world", 0.6, 1.0),
         ]]);
 
-        let mut aligner = MockAligner {
-            offsets: vec![(0.1, 0.4), (0.5, 0.9)],
-        };
+        let mut aligner = MockAligner::new(vec![(0.1, 0.4), (0.5, 0.9)]);
 
         let config = PipelineConfig::default();
         let audio = vec![0.0_f32; 16_000];
@@ -438,20 +447,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Tests: confidence-gated fallback to backend timestamps
+    // Tests: sentinel fallback to backend timestamps
     // -----------------------------------------------------------------------
 
     #[test]
-    fn low_confidence_alignment_keeps_backend_timestamps() {
+    fn low_confidence_alignment_is_applied() {
         let backend = MockRecognizer::new(vec![vec![
             make_word("hello", 0.0, 0.5),
             make_word("world", 0.6, 1.0),
         ]]);
 
-        // First word has a usable alignment, second is below the 0.3 threshold
-        let mut aligner = ConfigurableAligner {
-            alignments: vec![(0.1, 0.4, 0.9), (0.5, 0.9, 0.1)],
-        };
+        let mut aligner = ConfigurableAligner::new(vec![(0.1, 0.4, 0.9), (0.5, 0.9, 0.1)]);
 
         let config = PipelineConfig::default();
         let audio = vec![0.0_f32; 16_000];
@@ -461,14 +467,10 @@ mod tests {
                 .unwrap();
 
         assert_eq!(result.words.len(), 2);
-
-        // Confident word: CTC timings applied
         assert!((result.words[0].start - 0.1).abs() < f64::EPSILON);
         assert!((result.words[0].end - 0.4).abs() < f64::EPSILON);
-
-        // Low-confidence word: Whisper timestamps preserved
-        assert!((result.words[1].start - 0.6).abs() < f64::EPSILON);
-        assert!((result.words[1].end - 1.0).abs() < f64::EPSILON);
+        assert!((result.words[1].start - 0.5).abs() < f64::EPSILON);
+        assert!((result.words[1].end - 0.9).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -478,10 +480,7 @@ mod tests {
             make_word("-", 0.6, 0.9),
         ]]);
 
-        // Second word is the punctuation sentinel: (0, 0, 0) from group_into_words
-        let mut aligner = ConfigurableAligner {
-            alignments: vec![(0.1, 0.4, 0.9), (0.0, 0.0, 0.0)],
-        };
+        let mut aligner = ConfigurableAligner::new(vec![(0.1, 0.4, 0.9), (0.0, 0.0, 0.0)]);
 
         let config = PipelineConfig::default();
         let audio = vec![0.0_f32; 16_000];
@@ -616,9 +615,7 @@ mod tests {
             make_word("three", 0.8, 1.1),
         ]]);
 
-        let mut aligner = MockAligner {
-            offsets: vec![(0.05, 0.25), (0.30, 0.60), (0.70, 1.00)],
-        };
+        let mut aligner = MockAligner::new(vec![(0.05, 0.25), (0.30, 0.60), (0.70, 1.00)]);
 
         let config = PipelineConfig::default();
         let audio = vec![0.0_f32; 16_000];
@@ -649,7 +646,8 @@ mod tests {
     #[test]
     fn pipeline_config_defaults() {
         let config = PipelineConfig::default();
-        assert!((config.padding_seconds - 0.1).abs() < f64::EPSILON);
+        assert!((config.padding_seconds - 0.3).abs() < f64::EPSILON);
+        assert!((config.min_chunk_seconds - 5.0).abs() < f64::EPSILON);
         assert!((config.max_chunk_seconds - 30.0).abs() < f64::EPSILON);
         assert_eq!(config.transcribe_config.language, "en");
     }

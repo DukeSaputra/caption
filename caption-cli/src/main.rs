@@ -792,7 +792,8 @@ fn run_transcribe(cli: &Cli) -> Result<()> {
             temperature: 0.0,
             vad_model_path,
         },
-        padding_seconds: 0.1,
+        padding_seconds: 0.3,
+        min_chunk_seconds: 5.0,
         max_chunk_seconds: 30.0,
     };
 

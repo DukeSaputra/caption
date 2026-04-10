@@ -116,15 +116,6 @@ fn peak_normalize(samples: &mut [f32]) {
     }
 }
 
-/// Soft feed-forward compressor that reduces dynamic range before CTC alignment.
-///
-/// Why: wav2vec2 emits blank-dominated probabilities on quiet passages, which
-/// causes the Viterbi aligner to cluster words near the next loud region.
-/// Compressing the dynamic range lifts quiet speech closer to the loud parts
-/// so every frame carries usable acoustic evidence.
-///
-/// Applied per-chunk inside the CTC alignment stage only. VAD and Whisper
-/// see natural dynamics so their decisions aren't biased by equalization.
 pub(crate) fn compress_dynamic_range(samples: &mut [f32], sample_rate: u32) {
     if samples.is_empty() {
         return;
