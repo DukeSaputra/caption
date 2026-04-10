@@ -166,10 +166,33 @@ pub fn transcribe_pipeline(
         }
     }
 
+    enforce_monotonic_timestamps(&mut all_words);
+
     Ok(Transcription {
         words: all_words,
         language,
     })
+}
+
+/// Walk the word list and guarantee monotonically non-decreasing timestamps.
+///
+/// Why: we mix CTC alignments (for high-confidence words) with Whisper's
+/// backend timestamps (for low-confidence or zero-duration ones). The two
+/// sources don't always agree on the absolute timeline, so the merged
+/// sequence can be non-monotonic. Downstream (SRT writer's overlap clamp)
+/// then produces negative-duration cues. Clamp `start` forward and keep
+/// `end >= start` so no cue inverts.
+fn enforce_monotonic_timestamps(words: &mut [Word]) {
+    let mut prev_start = f64::NEG_INFINITY;
+    for word in words.iter_mut() {
+        if word.start < prev_start {
+            word.start = prev_start;
+        }
+        if word.end < word.start {
+            word.end = word.start;
+        }
+        prev_start = word.start;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -470,6 +493,64 @@ mod tests {
         assert_eq!(result.words.len(), 2);
         assert!((result.words[1].start - 0.6).abs() < f64::EPSILON);
         assert!((result.words[1].end - 0.9).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: monotonic timestamp enforcement
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn monotonic_pass_fixes_backwards_start() {
+        let mut words = vec![
+            make_word("the", 23.004, 23.164),
+            make_word("key", 23.164, 23.300),
+            make_word("is", 22.994, 23.094),
+            make_word("to", 23.094, 23.204),
+        ];
+        enforce_monotonic_timestamps(&mut words);
+
+        for pair in words.windows(2) {
+            assert!(
+                pair[1].start >= pair[0].start,
+                "Non-monotonic start: {} follows {}",
+                pair[1].start,
+                pair[0].start
+            );
+        }
+        for w in &words {
+            assert!(w.end >= w.start, "Inverted cue: {} -> {}", w.start, w.end);
+        }
+    }
+
+    #[test]
+    fn monotonic_pass_preserves_already_monotonic() {
+        let mut words = vec![
+            make_word("a", 0.0, 0.3),
+            make_word("b", 0.4, 0.6),
+            make_word("c", 0.8, 1.0),
+        ];
+        let original = words.clone();
+        enforce_monotonic_timestamps(&mut words);
+
+        for (w, o) in words.iter().zip(original.iter()) {
+            assert!((w.start - o.start).abs() < f64::EPSILON);
+            assert!((w.end - o.end).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn monotonic_pass_empty_is_noop() {
+        let mut words: Vec<Word> = vec![];
+        enforce_monotonic_timestamps(&mut words);
+        assert!(words.is_empty());
+    }
+
+    #[test]
+    fn monotonic_pass_clamps_inverted_end() {
+        let mut words = vec![make_word("key", 23.164, 22.993)];
+        enforce_monotonic_timestamps(&mut words);
+        assert!((words[0].start - 23.164).abs() < f64::EPSILON);
+        assert!((words[0].end - 23.164).abs() < f64::EPSILON);
     }
 
     // -----------------------------------------------------------------------
