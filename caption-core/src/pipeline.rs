@@ -1,9 +1,15 @@
 use log::debug;
 
 use crate::align::ForcedAligner;
+use crate::audio::resample::compress_dynamic_range;
 use crate::error::CaptionError;
 use crate::stt::{SpeechRecognizer, TranscribeConfig, Transcription, Word};
 use crate::vad::{extract_chunks, StandaloneVad};
+
+/// Minimum CTC alignment confidence required to overwrite Whisper's
+/// backend timestamps. Below this we keep Whisper's word timings, which
+/// are noisier but never cluster or collapse to zero.
+const MIN_ALIGNMENT_CONFIDENCE: f32 = 0.3;
 
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
@@ -117,20 +123,37 @@ pub fn transcribe_pipeline(
                 .map(|w| w.text.clone())
                 .collect();
 
-            match aligner_ref.align(chunk_audio, sample_rate, &word_texts) {
+            // Compress only the audio fed into the CTC aligner. VAD and
+            // Whisper above ran on uncompressed audio so their decisions
+            // aren't biased by equalized dynamics.
+            let mut aligner_audio = chunk_audio.clone();
+            compress_dynamic_range(&mut aligner_audio, sample_rate);
+
+            match aligner_ref.align(&aligner_audio, sample_rate, &word_texts) {
                 Ok(alignments) => {
+                    let mut applied = 0_usize;
+                    let mut rejected = 0_usize;
                     for (word, alignment) in all_words[chunk_word_start..chunk_word_end]
                         .iter_mut()
                         .zip(alignments.iter())
                     {
-                        word.start = alignment.start + chunk_start;
-                        word.end = alignment.end + chunk_start;
-                        word.confidence = alignment.confidence;
+                        let duration = alignment.end - alignment.start;
+                        let confident = alignment.confidence >= MIN_ALIGNMENT_CONFIDENCE;
+                        if duration > 0.0 && confident {
+                            word.start = alignment.start + chunk_start;
+                            word.end = alignment.end + chunk_start;
+                            word.confidence = alignment.confidence;
+                            applied += 1;
+                        } else {
+                            rejected += 1;
+                        }
                     }
                     debug!(
-                        "Aligned {} words for chunk at {:.2}s",
+                        "Aligned {} words for chunk at {:.2}s ({} applied, {} kept Whisper timestamps)",
                         alignments.len(),
-                        chunk_start
+                        chunk_start,
+                        applied,
+                        rejected
                     );
                 }
                 Err(e) => {
@@ -233,6 +256,34 @@ mod tests {
                 });
             }
             Ok(result)
+        }
+    }
+
+    struct ConfigurableAligner {
+        alignments: Vec<(f64, f64, f32)>,
+    }
+
+    impl ForcedAligner for ConfigurableAligner {
+        fn align(
+            &mut self,
+            _audio: &[f32],
+            _sample_rate: u32,
+            words: &[String],
+        ) -> Result<Vec<WordAlignment>, CaptionError> {
+            Ok(words
+                .iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    let (start, end, confidence) =
+                        self.alignments.get(i).copied().unwrap_or((0.0, 0.0, 0.0));
+                    WordAlignment {
+                        text: text.clone(),
+                        start,
+                        end,
+                        confidence,
+                    }
+                })
+                .collect())
         }
     }
 
@@ -361,6 +412,64 @@ mod tests {
         assert!((result.words[0].start - 0.0).abs() < f64::EPSILON);
         assert!((result.words[0].end - 0.5).abs() < f64::EPSILON);
         assert!((result.words[1].start - 0.6).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: confidence-gated fallback to backend timestamps
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn low_confidence_alignment_keeps_backend_timestamps() {
+        let backend = MockRecognizer::new(vec![vec![
+            make_word("hello", 0.0, 0.5),
+            make_word("world", 0.6, 1.0),
+        ]]);
+
+        // First word has a usable alignment, second is below the 0.3 threshold
+        let mut aligner = ConfigurableAligner {
+            alignments: vec![(0.1, 0.4, 0.9), (0.5, 0.9, 0.1)],
+        };
+
+        let config = PipelineConfig::default();
+        let audio = vec![0.0_f32; 16_000];
+
+        let result =
+            transcribe_pipeline(&audio, 16_000, &backend, None, Some(&mut aligner), &config)
+                .unwrap();
+
+        assert_eq!(result.words.len(), 2);
+
+        // Confident word: CTC timings applied
+        assert!((result.words[0].start - 0.1).abs() < f64::EPSILON);
+        assert!((result.words[0].end - 0.4).abs() < f64::EPSILON);
+
+        // Low-confidence word: Whisper timestamps preserved
+        assert!((result.words[1].start - 0.6).abs() < f64::EPSILON);
+        assert!((result.words[1].end - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn zero_duration_alignment_keeps_backend_timestamps() {
+        let backend = MockRecognizer::new(vec![vec![
+            make_word("hello", 0.0, 0.5),
+            make_word("-", 0.6, 0.9),
+        ]]);
+
+        // Second word is the punctuation sentinel: (0, 0, 0) from group_into_words
+        let mut aligner = ConfigurableAligner {
+            alignments: vec![(0.1, 0.4, 0.9), (0.0, 0.0, 0.0)],
+        };
+
+        let config = PipelineConfig::default();
+        let audio = vec![0.0_f32; 16_000];
+
+        let result =
+            transcribe_pipeline(&audio, 16_000, &backend, None, Some(&mut aligner), &config)
+                .unwrap();
+
+        assert_eq!(result.words.len(), 2);
+        assert!((result.words[1].start - 0.6).abs() < f64::EPSILON);
+        assert!((result.words[1].end - 0.9).abs() < f64::EPSILON);
     }
 
     // -----------------------------------------------------------------------

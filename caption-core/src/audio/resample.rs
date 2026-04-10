@@ -20,7 +20,6 @@ pub fn prepare_for_stt(audio: AudioData) -> Result<Vec<f32>, CaptionError> {
 
     remove_dc_offset(&mut mono);
     peak_normalize(&mut mono);
-    compress_dynamic_range(&mut mono, source_rate);
     highpass_filter(&mut mono, 80.0, source_rate);
 
     if source_rate == TARGET_SAMPLE_RATE {
@@ -123,7 +122,10 @@ fn peak_normalize(samples: &mut [f32]) {
 /// causes the Viterbi aligner to cluster words near the next loud region.
 /// Compressing the dynamic range lifts quiet speech closer to the loud parts
 /// so every frame carries usable acoustic evidence.
-fn compress_dynamic_range(samples: &mut [f32], sample_rate: u32) {
+///
+/// Applied per-chunk inside the CTC alignment stage only. VAD and Whisper
+/// see natural dynamics so their decisions aren't biased by equalization.
+pub(crate) fn compress_dynamic_range(samples: &mut [f32], sample_rate: u32) {
     if samples.is_empty() {
         return;
     }
