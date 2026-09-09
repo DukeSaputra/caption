@@ -281,9 +281,9 @@ pub fn extract_chunks(
 
     let merged = merge_close_segments(padded, 0.0);
 
-    let long_enough = merge_to_minimum_length(merged, min_chunk_seconds);
+    let long_enough = merge_to_minimum_length(merged, min_chunk_seconds, max_chunk_seconds);
 
-    let final_segments = split_long_segments(long_enough, max_chunk_seconds);
+    let final_segments = split_long_segments(long_enough, max_chunk_seconds, audio, sample_rate);
 
     final_segments
         .into_iter()
@@ -296,7 +296,11 @@ pub fn extract_chunks(
         .collect()
 }
 
-fn merge_to_minimum_length(segments: Vec<SpeechSegment>, min_seconds: f64) -> Vec<SpeechSegment> {
+fn merge_to_minimum_length(
+    segments: Vec<SpeechSegment>,
+    min_seconds: f64,
+    max_seconds: f64,
+) -> Vec<SpeechSegment> {
     if segments.len() <= 1 || min_seconds <= 0.0 {
         return segments;
     }
@@ -306,7 +310,13 @@ fn merge_to_minimum_length(segments: Vec<SpeechSegment>, min_seconds: f64) -> Ve
     while i < segments.len() {
         let mut current = segments[i].clone();
         i += 1;
-        while (current.end - current.start) < min_seconds && i < segments.len() {
+        // Absorbing a neighbour is only worth it while the result still fits the
+        // decoder window. Merging past it just forces a hard mid-speech split
+        // later, which is what costs words at the seam.
+        while (current.end - current.start) < min_seconds
+            && i < segments.len()
+            && (segments[i].end - current.start) <= max_seconds
+        {
             current.end = segments[i].end;
             i += 1;
         }
@@ -318,7 +328,12 @@ fn merge_to_minimum_length(segments: Vec<SpeechSegment>, min_seconds: f64) -> Ve
             let last = result.last().expect("non-empty");
             last.end - last.start
         };
-        if last_duration < min_seconds {
+        let folded_duration = {
+            let last = result.last().expect("non-empty");
+            let previous = result[result.len() - 2].start;
+            last.end - previous
+        };
+        if last_duration < min_seconds && folded_duration <= max_seconds {
             let last = result.pop().expect("non-empty");
             result.last_mut().expect("non-empty").end = last.end;
         }
@@ -327,29 +342,87 @@ fn merge_to_minimum_length(segments: Vec<SpeechSegment>, min_seconds: f64) -> Ve
     result
 }
 
-fn split_long_segments(segments: Vec<SpeechSegment>, max_seconds: f64) -> Vec<SpeechSegment> {
+/// How far back from the ideal boundary we hunt for a pause to cut on.
+///
+/// A speech run longer than the decoder window has to be cut somewhere. Cutting
+/// at the exact arithmetic boundary lands mid-word roughly as often as not, and
+/// the word straddling the seam is truncated in both pieces, so Whisper drops or
+/// mangles it. Looking back a few seconds almost always finds a real pause.
+const SPLIT_SEARCH_SECONDS: f64 = 3.0;
+
+/// Width of the window whose energy we measure while hunting for that pause.
+const SPLIT_PROBE_SECONDS: f64 = 0.02;
+
+fn split_long_segments(
+    segments: Vec<SpeechSegment>,
+    max_seconds: f64,
+    audio: &[f32],
+    sample_rate: u32,
+) -> Vec<SpeechSegment> {
     let mut result = Vec::with_capacity(segments.len());
 
     for seg in segments {
         let duration = seg.end - seg.start;
         if duration <= max_seconds {
             result.push(seg);
-        } else {
-            let num_pieces = (duration / max_seconds).ceil() as usize;
-            let piece_duration = duration / num_pieces as f64;
-            for i in 0..num_pieces {
-                let start = seg.start + i as f64 * piece_duration;
-                let end = if i == num_pieces - 1 {
-                    seg.end
-                } else {
-                    start + piece_duration
-                };
-                result.push(SpeechSegment { start, end });
+            continue;
+        }
+
+        // A cut may drift up to SPLIT_SEARCH_SECONDS earlier than its ideal
+        // boundary, which lengthens the piece that follows by the same amount.
+        // Size the pieces so that even a fully drifted cut stays inside the
+        // decoder window -- overshooting it would truncate audio in Whisper.
+        let budget = (max_seconds - SPLIT_SEARCH_SECONDS).max(max_seconds * 0.5);
+        let pieces = (duration / budget).ceil().max(1.0);
+        let piece_duration = duration / pieces;
+
+        let mut start = seg.start;
+        for i in 1..pieces as usize {
+            let ideal = seg.start + i as f64 * piece_duration;
+            let earliest = (ideal - SPLIT_SEARCH_SECONDS).max(start);
+            let cut = quietest_point(audio, sample_rate, earliest, ideal);
+            if cut > start {
+                result.push(SpeechSegment { start, end: cut });
+                start = cut;
             }
         }
+        result.push(SpeechSegment {
+            start,
+            end: seg.end,
+        });
     }
 
     result
+}
+
+/// Midpoint of the lowest-energy probe window in `[from, to]`.
+///
+/// Ties resolve to the latest position, so uniformly loud audio cuts at the
+/// ideal boundary rather than dragging every piece short. Falls back to `to`
+/// when there is no audio to inspect.
+fn quietest_point(audio: &[f32], sample_rate: u32, from: f64, to: f64) -> f64 {
+    let sr = f64::from(sample_rate);
+    let probe = (SPLIT_PROBE_SECONDS * sr).round() as usize;
+    let begin = (from * sr).round() as usize;
+    let end = ((to * sr).round() as usize).min(audio.len());
+
+    if probe == 0 || begin + probe > end {
+        return to;
+    }
+
+    let mut best_start = begin;
+    let mut best_energy = f32::INFINITY;
+    let mut index = begin;
+    while index + probe <= end {
+        let energy: f32 = audio[index..index + probe].iter().map(|s| s * s).sum();
+        if energy <= best_energy {
+            best_energy = energy;
+            best_start = index;
+        }
+        index += probe;
+    }
+
+    (best_start + probe / 2) as f64 / sr
 }
 
 // ---------------------------------------------------------------------------
@@ -642,13 +715,90 @@ mod tests {
     // split_long_segments tests
     // -----------------------------------------------------------------------
 
+    /// 16 kHz "speech" (loud alternating samples) with silent windows carved out,
+    /// so a test can place a pause exactly where it wants one.
+    fn audio_with_silence(duration_seconds: f64, silences: &[(f64, f64)]) -> Vec<f32> {
+        let sr = 16_000.0;
+        let total = (duration_seconds * sr) as usize;
+        let mut audio: Vec<f32> = (0..total)
+            .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
+            .collect();
+        for (from, to) in silences {
+            let begin = (*from * sr) as usize;
+            let end = ((*to * sr) as usize).min(total);
+            for sample in &mut audio[begin..end] {
+                *sample = 0.0;
+            }
+        }
+        audio
+    }
+
+    #[test]
+    fn split_cuts_at_quiet_point() {
+        // 40s of continuous speech with a real pause just before the ideal cut.
+        // The boundary must land in the pause, not mid-word at the arithmetic point.
+        let audio = audio_with_silence(40.0, &[(19.0, 19.6)]);
+        let segments = vec![SpeechSegment {
+            start: 0.0,
+            end: 40.0,
+        }];
+
+        let result = split_long_segments(segments, 30.0, &audio, 16_000);
+
+        assert!(result.len() >= 2);
+        let cut = result[0].end;
+        assert!(
+            (19.0..=19.6).contains(&cut),
+            "cut should land inside the pause, got {cut}"
+        );
+    }
+
+    #[test]
+    fn split_pieces_never_exceed_max() {
+        let audio = audio_with_silence(100.0, &[(24.0, 24.4), (50.0, 50.4), (77.0, 77.4)]);
+        let segments = vec![SpeechSegment {
+            start: 0.0,
+            end: 100.0,
+        }];
+
+        let result = split_long_segments(segments, 30.0, &audio, 16_000);
+
+        for piece in &result {
+            let duration = piece.end - piece.start;
+            assert!(
+                duration <= 30.0 + 1e-9,
+                "piece exceeds Whisper's window: {duration}s"
+            );
+        }
+    }
+
+    #[test]
+    fn split_covers_the_whole_segment() {
+        let audio = audio_with_silence(70.0, &[(25.0, 25.5)]);
+        let segments = vec![SpeechSegment {
+            start: 0.0,
+            end: 70.0,
+        }];
+
+        let result = split_long_segments(segments, 30.0, &audio, 16_000);
+
+        assert!((result[0].start - 0.0).abs() < f64::EPSILON);
+        assert!((result.last().unwrap().end - 70.0).abs() < f64::EPSILON);
+        for pair in result.windows(2) {
+            assert!(
+                (pair[1].start - pair[0].end).abs() < f64::EPSILON,
+                "pieces must be contiguous, no audio dropped"
+            );
+        }
+    }
+
     #[test]
     fn split_short_segment_unchanged() {
         let segments = vec![SpeechSegment {
             start: 0.0,
             end: 10.0,
         }];
-        let result = split_long_segments(segments, 30.0);
+        let result = split_long_segments(segments, 30.0, &[], 16000);
         assert_eq!(result.len(), 1);
     }
 
@@ -658,7 +808,7 @@ mod tests {
             start: 0.0,
             end: 30.0,
         }];
-        let result = split_long_segments(segments, 30.0);
+        let result = split_long_segments(segments, 30.0, &[], 16000);
         assert_eq!(result.len(), 1);
     }
 
@@ -668,7 +818,7 @@ mod tests {
             start: 0.0,
             end: 31.0,
         }];
-        let result = split_long_segments(segments, 30.0);
+        let result = split_long_segments(segments, 30.0, &[], 16000);
         assert_eq!(result.len(), 2);
         assert!((result[0].start - 0.0).abs() < f64::EPSILON);
         assert!((result[1].end - 31.0).abs() < f64::EPSILON);
@@ -678,18 +828,26 @@ mod tests {
     }
 
     #[test]
-    fn split_three_pieces() {
+    fn split_long_run_leaves_room_to_seek_a_pause() {
+        // 90s at a 30s max no longer yields three exactly-30s pieces: each cut
+        // needs SPLIT_SEARCH_SECONDS of room to drift back onto a pause, so the
+        // pieces are sized to stay inside the window even when fully drifted.
         let segments = vec![SpeechSegment {
             start: 0.0,
             end: 90.0,
         }];
-        let result = split_long_segments(segments, 30.0);
-        assert_eq!(result.len(), 3);
-        assert!((result[0].end - 30.0).abs() < f64::EPSILON);
-        assert!((result[1].start - 30.0).abs() < f64::EPSILON);
-        assert!((result[1].end - 60.0).abs() < f64::EPSILON);
-        assert!((result[2].start - 60.0).abs() < f64::EPSILON);
-        assert!((result[2].end - 90.0).abs() < f64::EPSILON);
+        let result = split_long_segments(segments, 30.0, &[], 16000);
+
+        assert_eq!(result.len(), 4);
+        assert!((result[0].start - 0.0).abs() < f64::EPSILON);
+        assert!((result.last().unwrap().end - 90.0).abs() < f64::EPSILON);
+        for piece in &result {
+            let duration = piece.end - piece.start;
+            assert!(
+                duration <= 30.0 + 1e-9,
+                "piece exceeds the decoder window: {duration}s"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -755,15 +913,18 @@ mod tests {
             end: 90.0,
         }];
         let chunks = extract_chunks(&audio, 16_000, &segments, 0.0, 0.0, 30.0);
-        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks.len(), 4);
 
+        let mut total = 0usize;
         for (chunk, _) in &chunks {
             let duration = chunk.len() as f64 / 16_000.0;
             assert!(
-                (duration - 30.0).abs() < 0.1,
-                "Expected ~30s chunk, got {duration:.2}s"
+                duration <= 30.0 + 1e-9,
+                "chunk exceeds the decoder window: {duration:.2}s"
             );
+            total += chunk.len();
         }
+        assert_eq!(total, 90 * 16_000, "splitting must not drop any audio");
     }
 
     #[test]
@@ -795,8 +956,29 @@ mod tests {
                 end: 20.0,
             },
         ];
-        let result = merge_to_minimum_length(segments, 5.0);
+        let result = merge_to_minimum_length(segments, 5.0, 30.0);
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn merge_to_minimum_stops_before_max() {
+        // Absorbing the long neighbour would build a 40s chunk, past Whisper's
+        // 30s window, and force a hard mid-speech split later. Leave them apart.
+        let segments = vec![
+            SpeechSegment {
+                start: 0.0,
+                end: 4.0,
+            },
+            SpeechSegment {
+                start: 4.5,
+                end: 40.0,
+            },
+        ];
+
+        let result = merge_to_minimum_length(segments, 5.0, 30.0);
+
+        assert_eq!(result.len(), 2, "must not merge into an over-long chunk");
+        assert!((result[0].end - 4.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -815,7 +997,7 @@ mod tests {
                 end: 12.0,
             },
         ];
-        let result = merge_to_minimum_length(segments, 5.0);
+        let result = merge_to_minimum_length(segments, 5.0, 30.0);
         assert_eq!(result.len(), 2);
         assert!((result[0].start - 0.0).abs() < f64::EPSILON);
         assert!((result[0].end - 5.0).abs() < f64::EPSILON);
@@ -835,7 +1017,7 @@ mod tests {
                 end: 13.0,
             },
         ];
-        let result = merge_to_minimum_length(segments, 5.0);
+        let result = merge_to_minimum_length(segments, 5.0, 30.0);
         assert_eq!(result.len(), 1);
         assert!((result[0].start - 0.0).abs() < f64::EPSILON);
         assert!((result[0].end - 13.0).abs() < f64::EPSILON);
@@ -853,7 +1035,7 @@ mod tests {
                 end: 3.0,
             },
         ];
-        let result = merge_to_minimum_length(segments, 0.0);
+        let result = merge_to_minimum_length(segments, 0.0, 30.0);
         assert_eq!(result.len(), 2);
     }
 
