@@ -182,6 +182,16 @@ const NGRAM_SIZE: usize = 5;
 
 const NGRAM_MAX_OCCURRENCES: usize = 2;
 
+/// Repeats only count as a Whisper loop when they cluster inside this span.
+///
+/// Whisper hallucinates by looping a phrase within a single decode window, so a
+/// real loop always fits inside one chunk (`PipelineConfig::max_chunk_seconds`
+/// is 30s). Ordinary speech reuses stock phrasing minutes apart -- an 87-minute
+/// meeting says "questions that you want to" many times without hallucinating.
+/// Without this window the filter cut long transcripts down to their first few
+/// hundred words.
+const NGRAM_LOCALITY_SECONDS: f64 = 30.0;
+
 fn remove_ngram_repetitions(words: &mut Vec<Word>) {
     if words.len() < NGRAM_SIZE {
         return;
@@ -198,21 +208,52 @@ fn remove_ngram_repetitions(words: &mut Vec<Word>) {
         ngram_positions.entry(gram).or_default().push(i);
     }
 
-    let mut earliest_cut: Option<usize> = None;
+    // Mark the looping copies for removal. We delete only the repeats
+    // themselves, never the rest of the transcript: content after a loop is
+    // ordinary speech that the old truncate-to-end behaviour threw away.
+    let mut doomed = vec![false; words.len()];
+    let mut any_marked = false;
 
     for positions in ngram_positions.values() {
-        if positions.len() > NGRAM_MAX_OCCURRENCES {
-            let cut = positions[NGRAM_MAX_OCCURRENCES];
-            earliest_cut = Some(match earliest_cut {
-                Some(prev) => prev.min(cut),
-                None => cut,
-            });
+        if positions.len() <= NGRAM_MAX_OCCURRENCES {
+            continue;
+        }
+
+        let mut burst_start = 0;
+        while burst_start < positions.len() {
+            let burst_time = words[positions[burst_start]].start;
+            let mut burst_end = burst_start;
+            while burst_end < positions.len()
+                && words[positions[burst_end]].start - burst_time <= NGRAM_LOCALITY_SECONDS
+            {
+                burst_end += 1;
+            }
+
+            // A burst only looks like a loop once it exceeds the allowance; the
+            // first NGRAM_MAX_OCCURRENCES copies in each burst are always kept.
+            let removal_start = (burst_start + NGRAM_MAX_OCCURRENCES).min(burst_end);
+            for &position in &positions[removal_start..burst_end] {
+                let span_end = (position + NGRAM_SIZE).min(doomed.len());
+                for slot in &mut doomed[position..span_end] {
+                    *slot = true;
+                }
+                any_marked = true;
+            }
+
+            burst_start = burst_end;
         }
     }
 
-    if let Some(cut) = earliest_cut {
-        words.truncate(cut);
+    if !any_marked {
+        return;
     }
+
+    let mut index = 0;
+    words.retain(|_| {
+        let keep = !doomed[index];
+        index += 1;
+        keep
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -233,25 +274,35 @@ const REPETITION_RATIO_THRESHOLD: f32 = 0.3;
 
 const MIN_WORDS_FOR_REPETITION_CHECK: usize = 5;
 
+/// How many trailing words the ratio is measured over.
+///
+/// The check must be local. Measured across a whole transcript the ratio is
+/// meaningless: natural speech reuses common words, so a real 15,779-word
+/// meeting scores 0.15 -- under the threshold -- and the old whole-transcript
+/// version truncated it at the first repeated word, keeping 9 words.
+const REPETITION_TAIL_WINDOW: usize = 50;
+
 fn prune_repetitive_tail(words: &mut Vec<Word>) {
     if words.len() < MIN_WORDS_FOR_REPETITION_CHECK {
         return;
     }
 
-    let total = words.len();
+    let window_start = words.len().saturating_sub(REPETITION_TAIL_WINDOW);
+    let window = &words[window_start..];
+
     let unique: std::collections::HashSet<String> =
-        words.iter().map(|w| w.text.to_lowercase()).collect();
-    let ratio = unique.len() as f32 / total as f32;
+        window.iter().map(|w| w.text.to_lowercase()).collect();
+    let ratio = unique.len() as f32 / window.len() as f32;
 
     if ratio >= REPETITION_RATIO_THRESHOLD {
         return;
     }
 
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (idx, word) in words.iter().enumerate() {
+    for (offset, word) in window.iter().enumerate() {
         let lower = word.text.to_lowercase();
         if !seen.insert(lower) {
-            words.truncate(idx);
+            words.truncate(window_start + offset);
             return;
         }
     }
@@ -542,7 +593,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn ngram_three_occurrences_truncates_at_third() {
+    fn ngram_third_local_occurrence_removed_and_rest_kept() {
         let mut words = vec![
             word("a"),
             word("b"),
@@ -567,9 +618,12 @@ mod tests {
             word("k"),
         ];
         remove_ngram_repetitions(&mut words);
+        // The third copy of "a b c d e" is dropped, but the words that follow it
+        // ("j", "k") are ordinary content and survive. Previously the whole tail
+        // was truncated, which is what destroyed long transcripts.
         assert_eq!(
             texts(&words),
-            &["a", "b", "c", "d", "e", "f", "g", "a", "b", "c", "d", "e", "h", "i"]
+            &["a", "b", "c", "d", "e", "f", "g", "a", "b", "c", "d", "e", "h", "i", "j", "k"]
         );
     }
 
@@ -630,6 +684,179 @@ mod tests {
         assert_eq!(
             texts(&words),
             &["the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "today"]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: n-gram locality (long-form transcripts)
+    // -----------------------------------------------------------------------
+
+    /// Build a run of words starting at `start_time`, one word every 0.4s.
+    fn words_at(texts: &[&str], start_time: f64) -> Vec<Word> {
+        texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let start = start_time + i as f64 * 0.4;
+                Word {
+                    text: (*text).to_string(),
+                    start,
+                    end: start + 0.35,
+                    confidence: 0.99,
+                }
+            })
+            .collect()
+    }
+
+    const PHRASE: [&str; 5] = ["questions", "that", "you", "want", "to"];
+
+    #[test]
+    fn ngram_repeats_far_apart_in_time_are_kept() {
+        // A real 87-minute meeting says "questions that you want to" three times,
+        // minutes apart. That is ordinary speech, not a Whisper loop.
+        let mut words = Vec::new();
+        words.extend(words_at(
+            &["welcome", "to", "this", "morning", "session"],
+            0.0,
+        ));
+        words.extend(words_at(&PHRASE, 10.0));
+        words.extend(words_at(&["please", "pop", "them", "in", "chat"], 300.0));
+        words.extend(words_at(&PHRASE, 320.0));
+        words.extend(words_at(&["we", "will", "cover", "them", "shortly"], 900.0));
+        words.extend(words_at(&PHRASE, 920.0));
+
+        let before = words.len();
+        remove_ngram_repetitions(&mut words);
+
+        assert_eq!(
+            words.len(),
+            before,
+            "far-apart repeats must not truncate the transcript"
+        );
+    }
+
+    #[test]
+    fn ngram_content_after_repetition_burst_survives() {
+        // A genuine loop early on must not cost us the rest of the recording.
+        let mut words = Vec::new();
+        words.extend(words_at(&PHRASE, 10.0));
+        words.extend(words_at(&PHRASE, 12.0));
+        words.extend(words_at(&PHRASE, 14.0));
+        words.extend(words_at(&PHRASE, 16.0));
+        words.extend(words_at(
+            &["now", "lets", "talk", "about", "endorsement"],
+            600.0,
+        ));
+
+        remove_ngram_repetitions(&mut words);
+
+        let kept = texts(&words);
+        assert!(
+            kept.ends_with(&["now", "lets", "talk", "about", "endorsement"]),
+            "content after the burst must survive, got: {kept:?}"
+        );
+    }
+
+    #[test]
+    fn ngram_tight_repeats_are_still_removed() {
+        // Whisper looping the same phrase within a few seconds is a hallucination.
+        let mut words = Vec::new();
+        words.extend(words_at(&PHRASE, 10.0));
+        words.extend(words_at(&PHRASE, 12.0));
+        words.extend(words_at(&PHRASE, 14.0));
+        words.extend(words_at(&PHRASE, 16.0));
+
+        let before = words.len();
+        remove_ngram_repetitions(&mut words);
+
+        assert!(
+            words.len() < before,
+            "a tight repetition loop must still be trimmed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: repetition-ratio pruning over long transcripts
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prune_tail_keeps_long_varied_speech() {
+        // Natural speech reuses common words constantly; across 15k words the
+        // global unique/total ratio sits near 0.15, well under the 0.3 threshold.
+        let vocabulary = [
+            "we",
+            "are",
+            "going",
+            "to",
+            "look",
+            "at",
+            "the",
+            "questions",
+            "you",
+            "have",
+            "asked",
+            "and",
+            "answer",
+            "them",
+            "in",
+            "themes",
+            "today",
+        ];
+        let mut words: Vec<Word> = Vec::new();
+        for i in 0..600 {
+            let text = vocabulary[i % vocabulary.len()];
+            let start = i as f64 * 0.4;
+            words.push(Word {
+                text: text.to_string(),
+                start,
+                end: start + 0.35,
+                confidence: 0.99,
+            });
+        }
+
+        let before = words.len();
+        prune_repetitive_tail(&mut words);
+
+        assert_eq!(
+            words.len(),
+            before,
+            "ordinary long-form speech must not be pruned"
+        );
+    }
+
+    #[test]
+    fn prune_tail_still_trims_degenerate_ending() {
+        let mut words = words_at(
+            &[
+                "so",
+                "that",
+                "is",
+                "everything",
+                "we",
+                "wanted",
+                "to",
+                "cover",
+                "with",
+                "you",
+            ],
+            0.0,
+        );
+        for i in 0..60 {
+            let start = 100.0 + i as f64 * 0.4;
+            words.push(Word {
+                text: "okay".to_string(),
+                start,
+                end: start + 0.35,
+                confidence: 0.99,
+            });
+        }
+
+        let before = words.len();
+        prune_repetitive_tail(&mut words);
+
+        assert!(
+            words.len() < before,
+            "a degenerate repeated tail must still be pruned"
         );
     }
 
