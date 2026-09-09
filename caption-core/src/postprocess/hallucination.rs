@@ -130,6 +130,19 @@ fn remove_trailing_phrases(words: &mut Vec<Word>, allowed: &[String]) {
 // 4b: Consecutive-repeat detection
 // ---------------------------------------------------------------------------
 
+/// Trailing punctuation Whisper attaches to a word.
+const COMPARE_TRIM: &[char] = &['.', ',', ';', ':', '?', '!'];
+
+/// Key used to decide whether two words are "the same word".
+///
+/// `PunctuationStripper` runs *after* these filters, so words still carry their
+/// punctuation here: "Ganyat?" and "Ganyat" compare as different strings and the
+/// repeat escapes. Normalise for the comparison only -- the word's own text is
+/// never modified, so the stripper stays responsible for the final output.
+fn compare_key(text: &str) -> String {
+    text.trim_end_matches(COMPARE_TRIM).to_lowercase()
+}
+
 fn deduplicate_consecutive_repeats(words: &mut Vec<Word>) {
     if words.len() < 2 {
         return;
@@ -151,7 +164,7 @@ fn deduplicate_consecutive_repeats(words: &mut Vec<Word>) {
                 let matches = words[i..i + seq_len]
                     .iter()
                     .zip(words[next_start..next_end].iter())
-                    .all(|(a, b)| a.text.to_lowercase() == b.text.to_lowercase());
+                    .all(|(a, b)| compare_key(&a.text) == compare_key(&b.text));
                 if matches {
                     reps += 1;
                 } else {
@@ -203,7 +216,7 @@ fn remove_ngram_repetitions(words: &mut Vec<Word>) {
     for i in 0..=words.len() - NGRAM_SIZE {
         let gram: Vec<String> = words[i..i + NGRAM_SIZE]
             .iter()
-            .map(|w| w.text.to_lowercase())
+            .map(|w| compare_key(&w.text))
             .collect();
         ngram_positions.entry(gram).or_default().push(i);
     }
@@ -772,6 +785,62 @@ mod tests {
         assert!(
             words.len() < before,
             "a tight repetition loop must still be trimmed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: punctuation must not hide a repeat
+    //
+    // Whisper attaches punctuation to the word, and PunctuationStripper runs
+    // *after* these filters, so "Ganyat?" and "Ganyat" arrive here as different
+    // strings. Comparisons have to look past it.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dedup_ignores_trailing_punctuation() {
+        let mut words = vec![word("Ganyat?"), word("Ganyat")];
+        deduplicate_consecutive_repeats(&mut words);
+        assert_eq!(texts(&words), &["Ganyat?"]);
+    }
+
+    #[test]
+    fn dedup_ignores_trailing_period() {
+        let mut words = vec![word("Great."), word("great")];
+        deduplicate_consecutive_repeats(&mut words);
+        assert_eq!(texts(&words), &["Great."]);
+    }
+
+    #[test]
+    fn dedup_keeps_genuinely_different_words() {
+        let mut words = vec![word("great."), word("greater")];
+        deduplicate_consecutive_repeats(&mut words);
+        assert_eq!(texts(&words), &["great.", "greater"]);
+    }
+
+    #[test]
+    fn ngram_matches_across_trailing_punctuation() {
+        // Three copies of one phrase inside a few seconds, but the middle copy
+        // carries a comma. Without normalisation the loop stays hidden.
+        let mut words = Vec::new();
+        words.extend(words_at(
+            &["thank", "you", "very", "much", "everyone"],
+            10.0,
+        ));
+        words.extend(words_at(
+            &["thank,", "you", "very", "much", "everyone"],
+            12.0,
+        ));
+        words.extend(words_at(
+            &["thank", "you", "very", "much", "everyone"],
+            14.0,
+        ));
+
+        let before = words.len();
+        remove_ngram_repetitions(&mut words);
+
+        assert!(
+            words.len() < before,
+            "a punctuated copy must not hide the loop"
         );
     }
 
