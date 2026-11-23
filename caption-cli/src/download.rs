@@ -278,33 +278,6 @@ fn extract_tar_bz2(archive: &Path, target_dir: &Path) -> Result<PathBuf> {
     Ok(extracted)
 }
 
-fn extract_zip(archive: &Path, target_dir: &Path) -> Result<()> {
-    let file = fs::File::open(archive)
-        .with_context(|| format!("Failed to open archive '{}'", archive.display()))?;
-    let mut zip = zip::ZipArchive::new(file)
-        .with_context(|| format!("Failed to read zip archive '{}'", archive.display()))?;
-
-    for i in 0..zip.len() {
-        let mut entry = zip.by_index(i).context("Failed to read zip entry")?;
-        let Some(path) = entry.enclosed_name().map(|p| target_dir.join(p)) else {
-            continue;
-        };
-        if entry.is_dir() {
-            fs::create_dir_all(&path).ok();
-        } else {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).ok();
-            }
-            let mut out = fs::File::create(&path)
-                .with_context(|| format!("Failed to create '{}'", path.display()))?;
-            std::io::copy(&mut entry, &mut out)
-                .with_context(|| format!("Failed to write '{}'", path.display()))?;
-        }
-    }
-
-    Ok(())
-}
-
 fn exe_dir() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("Could not determine binary location")?;
     let exe = exe.canonicalize().unwrap_or(exe);
@@ -351,14 +324,7 @@ pub fn setup_dependencies() -> Result<()> {
         eprintln!("Already exists: {}", ffmpeg_path.display());
     }
 
-    let ort_name = if cfg!(target_os = "macos") {
-        "libonnxruntime.dylib"
-    } else if cfg!(windows) {
-        "onnxruntime.dll"
-    } else {
-        "libonnxruntime.so"
-    };
-    let ort_path = dir.join(ort_name);
+    let ort_path = dir.join(ORT_LIB);
     if !ort_path.is_file() {
         download_onnxruntime(&dir)?;
     } else {
@@ -410,82 +376,77 @@ fn download_ffmpeg(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+const ORT_LIB: &str = if cfg!(target_os = "macos") {
+    "libonnxruntime.dylib"
+} else if cfg!(windows) {
+    "onnxruntime.dll"
+} else {
+    "libonnxruntime.so"
+};
+
+const ORT_NUGET_URL: &str = "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.23.1/microsoft.ml.onnxruntime.1.23.1.nupkg";
+const ORT_NUGET_SHA256: &str = "e04551ecddfd42e1922c8cb916f5faf2c229ae5edfe2fe883cc1193c52e16a28";
+
+fn ort_nuget_entry(os: &str, arch: &str) -> Option<String> {
+    let (rid_os, lib) = match os {
+        "macos" => ("osx", "libonnxruntime.dylib"),
+        "windows" => ("win", "onnxruntime.dll"),
+        "linux" => ("linux", "libonnxruntime.so"),
+        _ => return None,
+    };
+    let rid_arch = match arch {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        _ => return None,
+    };
+    Some(format!("runtimes/{rid_os}-{rid_arch}/native/{lib}"))
+}
+
 fn download_onnxruntime(dir: &Path) -> Result<()> {
-    let version = "1.23.1";
-    let (url, archive_ext, lib_name) = if cfg!(target_os = "macos") {
-        (
-            format!("https://github.com/microsoft/onnxruntime/releases/download/v{version}/onnxruntime-osx-universal2-{version}.tgz"),
-            "tgz",
-            "libonnxruntime.dylib",
-        )
-    } else if cfg!(windows) {
-        (
-            format!("https://github.com/microsoft/onnxruntime/releases/download/v{version}/onnxruntime-win-x64-{version}.zip"),
-            "zip",
-            "onnxruntime.dll",
-        )
-    } else {
-        (
-            format!("https://github.com/microsoft/onnxruntime/releases/download/v{version}/onnxruntime-linux-x64-{version}.tgz"),
-            "tgz",
-            "libonnxruntime.so",
-        )
+    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+    let Some(entry_name) = ort_nuget_entry(os, arch) else {
+        bail!("ONNX Runtime has no prebuilt library for {os}-{arch}");
     };
 
-    let archive_name = format!("onnxruntime.{archive_ext}");
-    let archive_path = dir.join(&archive_name);
-    download_file_to(&url, &archive_path)?;
-
-    eprintln!("Extracting ONNX Runtime...");
-
-    if archive_ext == "tgz" {
-        let status = Command::new("tar")
-            .args(["xzf"])
-            .arg(&archive_path)
-            .arg("-C")
-            .arg(dir)
-            .status()
-            .context("Failed to extract ONNX Runtime")?;
-        if !status.success() {
-            let _ = fs::remove_file(&archive_path);
-            bail!("tar extraction failed");
-        }
-    } else {
-        extract_zip(&archive_path, dir).with_context(|| {
-            let _ = fs::remove_file(&archive_path);
-            "Failed to extract ONNX Runtime"
-        })?;
-    }
-
-    let lib_dest = dir.join(lib_name);
-    if !lib_dest.is_file() {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir()
-                && path
-                    .file_name()
-                    .map_or(false, |n| n.to_string_lossy().starts_with("onnxruntime"))
-            {
-                let lib_dir = path.join("lib");
-                let candidate = lib_dir.join(lib_name);
-                if candidate.is_file() {
-                    fs::copy(&candidate, &lib_dest)?;
-                    eprintln!("Installed: {}", lib_dest.display());
-                    let _ = fs::remove_dir_all(&path);
-                    break;
-                }
-            }
-        }
-    }
-
-    let _ = fs::remove_file(&archive_path);
-
-    if !lib_dest.is_file() {
-        bail!("Could not find {} in the extracted archive", lib_name);
-    }
+    let package_path = dir.join("onnxruntime.nupkg");
+    let result = install_ort_from_package(&package_path, &entry_name, &dir.join(ORT_LIB));
+    let _ = fs::remove_file(&package_path);
+    result?;
 
     eprintln!("ONNX Runtime installed.");
+    Ok(())
+}
+
+fn install_ort_from_package(package_path: &Path, entry_name: &str, lib_dest: &Path) -> Result<()> {
+    download_file_to(ORT_NUGET_URL, package_path)?;
+
+    let computed = compute_sha256(package_path)?;
+    if computed != ORT_NUGET_SHA256 {
+        bail!("ONNX Runtime package checksum mismatch: expected {ORT_NUGET_SHA256}, got {computed}");
+    }
+
+    eprintln!("Extracting ONNX Runtime...");
+    extract_zip_entry(package_path, entry_name, lib_dest).context("Failed to extract ONNX Runtime")
+}
+
+fn extract_zip_entry(archive: &Path, entry_name: &str, dest: &Path) -> Result<()> {
+    let file = fs::File::open(archive)
+        .with_context(|| format!("Failed to open archive '{}'", archive.display()))?;
+    let mut zip = zip::ZipArchive::new(file)
+        .with_context(|| format!("Failed to read zip archive '{}'", archive.display()))?;
+    let mut entry = zip
+        .by_name(entry_name)
+        .with_context(|| format!("'{entry_name}' not found in '{}'", archive.display()))?;
+
+    // setup skips an existing lib, so a truncated one must never land at dest
+    let partial = dest.with_extension("partial");
+    let written = fs::File::create(&partial)
+        .and_then(|mut out| std::io::copy(&mut entry, &mut out))
+        .and_then(|_| fs::rename(&partial, dest));
+    if let Err(e) = written {
+        let _ = fs::remove_file(&partial);
+        return Err(e).with_context(|| format!("Failed to write '{}'", dest.display()));
+    }
     Ok(())
 }
 
@@ -600,6 +561,109 @@ mod tests {
                 "Model '{}' has empty filename",
                 model.name
             );
+        }
+    }
+
+    const ORT_PACKAGE_LIBS: &[&str] = &[
+        "runtimes/linux-arm64/native/libonnxruntime.so",
+        "runtimes/linux-x64/native/libonnxruntime.so",
+        "runtimes/osx-arm64/native/libonnxruntime.dylib",
+        "runtimes/osx-x64/native/libonnxruntime.dylib",
+        "runtimes/win-arm64/native/onnxruntime.dll",
+        "runtimes/win-x64/native/onnxruntime.dll",
+    ];
+
+    #[test]
+    fn ort_entry_exists_in_package_for_every_supported_platform() {
+        for os in ["macos", "windows", "linux"] {
+            for arch in ["x86_64", "aarch64"] {
+                let entry = ort_nuget_entry(os, arch).unwrap();
+                assert!(ORT_PACKAGE_LIBS.contains(&entry.as_str()), "{os}-{arch}: {entry}");
+            }
+        }
+    }
+
+    #[test]
+    fn ort_entry_unsupported_platform_returns_none() {
+        assert_eq!(ort_nuget_entry("freebsd", "x86_64"), None);
+        assert_eq!(ort_nuget_entry("linux", "x86"), None);
+        assert_eq!(ort_nuget_entry("macos", "riscv64"), None);
+    }
+
+    #[test]
+    fn ort_entry_for_this_host_ends_with_installed_lib_name() {
+        let entry = ort_nuget_entry(std::env::consts::OS, std::env::consts::ARCH).unwrap();
+        assert!(entry.ends_with(&format!("/{ORT_LIB}")), "{entry}");
+    }
+
+    #[test]
+    fn ort_package_url_is_pinned_and_hashed() {
+        assert!(ORT_NUGET_URL.starts_with("https://api.nuget.org/"));
+        assert!(!ORT_NUGET_URL.contains("github.com"));
+        assert_eq!(ORT_NUGET_SHA256.len(), 64);
+        assert!(ORT_NUGET_SHA256.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    fn write_test_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let mut zip = zip::ZipWriter::new(fs::File::create(path).unwrap());
+        for (name, data) in entries {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(data).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn extract_zip_entry_writes_only_the_named_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("p.nupkg");
+        write_test_zip(
+            &archive,
+            &[
+                ("runtimes/osx-arm64/native/libonnxruntime.dylib", b"arm"),
+                ("runtimes/osx-x64/native/libonnxruntime.dylib", b"x64"),
+            ],
+        );
+        let dest = dir.path().join("libonnxruntime.dylib");
+        extract_zip_entry(&archive, "runtimes/osx-x64/native/libonnxruntime.dylib", &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"x64");
+        assert!(!dest.with_extension("partial").exists());
+        assert!(!dir.path().join("runtimes").exists());
+    }
+
+    #[test]
+    fn extract_zip_entry_missing_entry_errors_and_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("p.nupkg");
+        write_test_zip(&archive, &[("other.txt", b"x")]);
+        let dest = dir.path().join("libonnxruntime.so");
+        let err = extract_zip_entry(&archive, "runtimes/linux-x64/native/libonnxruntime.so", &dest)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("not found"));
+        assert!(!dest.exists());
+        assert!(!dest.with_extension("partial").exists());
+    }
+
+    #[test]
+    fn extract_zip_entry_not_a_zip_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("p.nupkg");
+        fs::write(&archive, b"not a zip").unwrap();
+        let dest = dir.path().join("onnxruntime.dll");
+        assert!(extract_zip_entry(&archive, "x", &dest).is_err());
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    #[ignore]
+    fn real_package_matches_hash_and_holds_every_lib() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("onnxruntime.nupkg");        let entry = ort_nuget_entry(std::env::consts::OS, std::env::consts::ARCH).unwrap();
+        install_ort_from_package(&package, &entry, &dir.path().join(ORT_LIB)).unwrap();
+        assert!(fs::metadata(dir.path().join(ORT_LIB)).unwrap().len() > 1_000_000);
+        let mut zip = zip::ZipArchive::new(fs::File::open(&package).unwrap()).unwrap();
+        for lib in ORT_PACKAGE_LIBS {
+            assert!(zip.by_name(lib).is_ok(), "{lib}");
         }
     }
 }

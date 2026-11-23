@@ -240,7 +240,7 @@ caption video.mp4 --initial-prompt "TikTok, iPhone, RSVP"
 | Silero VAD v5 | 2 MB | [GitHub](https://github.com/snakers4/silero-vad) | Voice activity detection, reduces hallucinations |
 | wav2vec2-base-960h | 91 MB | [HuggingFace](https://huggingface.co/onnx-community/wav2vec2-base-960h-ONNX) | CTC forced alignment (~20ms word timestamps) |
 | FFmpeg | ~80 MB | [GitHub](https://github.com/eugeneware/ffmpeg-static) | Audio extraction from video files |
-| ONNX Runtime | ~50 MB | [Microsoft GitHub](https://github.com/microsoft/onnxruntime) | Inference backend for alignment and VAD |
+| ONNX Runtime | ~35 MB (123 MB download) | [Microsoft NuGet](https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime/1.23.1) | Inference backend for alignment and VAD |
 | Inter Bold | <1 MB | [Google Fonts](https://fonts.google.com/specimen/Inter) | Font for burned-in subtitles (`--burn`) |
 
 Models are saved to `~/Library/Application Support/caption/models` on macOS, `%APPDATA%\caption\models` on Windows, and `~/.local/share/caption/models` on Linux. FFmpeg, ONNX Runtime, and the font are placed next to the `caption` binary.
