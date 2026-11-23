@@ -422,7 +422,9 @@ fn install_ort_from_package(package_path: &Path, entry_name: &str, lib_dest: &Pa
 
     let computed = compute_sha256(package_path)?;
     if computed != ORT_NUGET_SHA256 {
-        bail!("ONNX Runtime package checksum mismatch: expected {ORT_NUGET_SHA256}, got {computed}");
+        bail!(
+            "ONNX Runtime package checksum mismatch: expected {ORT_NUGET_SHA256}, got {computed}"
+        );
     }
 
     eprintln!("Extracting ONNX Runtime...");
@@ -578,7 +580,10 @@ mod tests {
         for os in ["macos", "windows", "linux"] {
             for arch in ["x86_64", "aarch64"] {
                 let entry = ort_nuget_entry(os, arch).unwrap();
-                assert!(ORT_PACKAGE_LIBS.contains(&entry.as_str()), "{os}-{arch}: {entry}");
+                assert!(
+                    ORT_PACKAGE_LIBS.contains(&entry.as_str()),
+                    "{os}-{arch}: {entry}"
+                );
             }
         }
     }
@@ -607,7 +612,8 @@ mod tests {
     fn write_test_zip(path: &Path, entries: &[(&str, &[u8])]) {
         let mut zip = zip::ZipWriter::new(fs::File::create(path).unwrap());
         for (name, data) in entries {
-            zip.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
             zip.write_all(data).unwrap();
         }
         zip.finish().unwrap();
@@ -625,7 +631,12 @@ mod tests {
             ],
         );
         let dest = dir.path().join("libonnxruntime.dylib");
-        extract_zip_entry(&archive, "runtimes/osx-x64/native/libonnxruntime.dylib", &dest).unwrap();
+        extract_zip_entry(
+            &archive,
+            "runtimes/osx-x64/native/libonnxruntime.dylib",
+            &dest,
+        )
+        .unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"x64");
         assert!(!dest.with_extension("partial").exists());
         assert!(!dir.path().join("runtimes").exists());
@@ -637,8 +648,12 @@ mod tests {
         let archive = dir.path().join("p.nupkg");
         write_test_zip(&archive, &[("other.txt", b"x")]);
         let dest = dir.path().join("libonnxruntime.so");
-        let err = extract_zip_entry(&archive, "runtimes/linux-x64/native/libonnxruntime.so", &dest)
-            .unwrap_err();
+        let err = extract_zip_entry(
+            &archive,
+            "runtimes/linux-x64/native/libonnxruntime.so",
+            &dest,
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("not found"));
         assert!(!dest.exists());
         assert!(!dest.with_extension("partial").exists());
@@ -658,7 +673,8 @@ mod tests {
     #[ignore]
     fn real_package_matches_hash_and_holds_every_lib() {
         let dir = tempfile::tempdir().unwrap();
-        let package = dir.path().join("onnxruntime.nupkg");        let entry = ort_nuget_entry(std::env::consts::OS, std::env::consts::ARCH).unwrap();
+        let package = dir.path().join("onnxruntime.nupkg");
+        let entry = ort_nuget_entry(std::env::consts::OS, std::env::consts::ARCH).unwrap();
         install_ort_from_package(&package, &entry, &dir.path().join(ORT_LIB)).unwrap();
         assert!(fs::metadata(dir.path().join(ORT_LIB)).unwrap().len() > 1_000_000);
         let mut zip = zip::ZipArchive::new(fs::File::open(&package).unwrap()).unwrap();
